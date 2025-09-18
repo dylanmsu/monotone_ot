@@ -1,0 +1,9 @@
+[submodule "extern/eigen"]
+	path = extern/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "extern/cimg"]
+	path = extern/cimg
+	url = https://github.com/GreycLab/CImg.git
+[submodule "extern/args"]
+	path = extern/args
+	url = https://github.com/Taywee/args.git
