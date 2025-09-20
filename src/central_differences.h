@@ -19,7 +19,7 @@ public:
 
         if (u.is_outside(t_eh_fwd) || u.is_outside(t_eh_bwd))
         {
-            return std::numeric_limits<double>::max();
+            return std::numeric_limits<double>::infinity();
         }
         else
         {
@@ -32,7 +32,7 @@ public:
 
         if (u.is_outside(t_eh_fwd))
         {
-            return std::numeric_limits<double>::max();
+            return std::numeric_limits<double>::infinity();
         }
         else
         {
@@ -48,7 +48,7 @@ public:
         return root - m1/(2.0*norm1) - m2/(2.0*norm2);
     }
 
-    double central_differences::interior_residual(Domain& u, std::vector<unsigned int> x, double b) {
+    double central_differences::S_MA(Domain& u, std::vector<unsigned int> x, double b) {
         std::vector<double> derivatives(4);
         std::vector<std::vector<int>> directions = {
             {0, 1},
@@ -66,6 +66,33 @@ public:
         double L2 = closed_form_maximum(directions[2], directions[3], derivatives[2], derivatives[3], b);
 
         return std::max(L1, L2);
+    }
+
+    double support_function_square(const std::vector<int>& e,
+                               double xmin, double xmax,
+                               double ymin, double ymax) {
+        double hx = (e[0] >= 0 ? xmax : xmin) * e[0];
+        double hy = (e[1] >= 0 ? ymax : ymin) * e[1];
+        return hx + hy;
+    }
+
+    double central_differences::S_BV2(Domain& u, std::vector<unsigned int> x) {
+        std::vector<std::vector<int>> directions = {
+            {0, 1},
+            {1, 0},
+            {1, 1},
+            {1, -1}
+        };
+
+        double residual = -std::numeric_limits<double>::infinity();
+        for (int i = 0; i < directions.size(); i++)
+        {
+            double deriv = directional_first_derivative(u, x, directions[i]);
+            double H = support_function_square(directions[i], 0.0, 1.0, 0.0, 1.0);
+            residual = std::max(residual, deriv - H);
+        }
+
+        return residual;
     }
 };
 

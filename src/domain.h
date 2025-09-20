@@ -12,8 +12,13 @@ private:
     unsigned int res_y;
 
 public:
-    Domain(/* args */);
-    ~Domain();
+    Domain::Domain(/* args */)
+    {
+    }
+
+    Domain::~Domain()
+    {
+    }
 
     double value(std::vector<unsigned int> x) {
         return u[x[1]][x[0]];
@@ -25,13 +30,5 @@ public:
 
     double h;
 };
-
-Domain::Domain(/* args */)
-{
-}
-
-Domain::~Domain()
-{
-}
 
 #endif // __DOMAIN_H__
