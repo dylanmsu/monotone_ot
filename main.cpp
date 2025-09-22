@@ -9,6 +9,8 @@
 #include "args/args.hxx"
 #include "cimg/CImg.h"
 
+#include "poisson_solver.h"
+
 void export_grid_to_svg(std::vector<std::vector<double>> &points, double width, double height, int res_x, int res_y, std::string filename, double stroke_width) {
     std::ofstream svg_file(filename, std::ios::out);
     if (!svg_file.is_open()) {
@@ -201,46 +203,83 @@ void grid_to_image(const std::vector<std::vector<double>>& image_grid, const std
     fclose(fp);
 }
 
-class Domain
-{
-private:
+void normalizeImage(std::vector<std::vector<double>> &F) {
+    double sum = 0.0;
 
+    // First, compute the total sum (integral)
+    for (const auto &row : F) {
+        for (double val : row) {
+            sum += val;
+        }
+    }
 
+    // Avoid division by zero
+    if (sum == 0.0) {
+        std::cerr << "Error: Integral (sum) is zero, cannot normalize." << std::endl;
+        return;
+    }
+
+    // Normalize each value
+    for (auto &row : F) {
+        for (double &val : row) {
+            val /= sum;
+        }
+    }
+}
+
+void subtractAverage(std::vector<std::vector<double>>& raster) {
+    // Calculate the average of the raster
+    double sum = 0.0;
+    int count = 0;
+
+    for (const auto& row : raster) {
+        for (double value : row) {
+            if (!std::isnan(value)) {
+                sum += value;
+                count++;
+            }
+        }
+    }
+
+    double average = sum / count;
+
+    // Subtract the average from each element of the raster
+    for (auto& row : raster) {
+        std::transform(row.begin(), row.end(), row.begin(), [average](double value) {
+            if (std::isnan(value)) {
+                return value;
+            } else {
+                return value - average;
+            }
+        });
+    }
+}
+
+class Domain {
 public:
     Domain(unsigned int res_x, unsigned int res_y)
+    : res_x(res_x), res_y(res_y)
     {
-        for (unsigned int x = 0; x < res_x; x++)
-        {
-            std::vector<double> row;
-            for (unsigned int y = 0; y < res_y; y++)
-            {
-                row.push_back(0.0);
-            }
-            this->u.push_back(row);
-        }
+        // store as u[row][col] == u[y][x]
+        u.assign(res_y, std::vector<double>(res_x, 0.0));
 
-        this->res_x = res_x;
-        this->res_y = res_y;
-
-        h = 1.0 / (double)(this->res_x);
+        // if domain mapped to [0,1] in x, spacing is 1/(N-1)
+        // if you map to [-1,1] use 2.0/(res_x-1)
+        h = 1.0 / double(res_x - 1);
     }
 
-    ~Domain()
-    {
+    double value(const std::vector<int>& pos) const {
+        int x = pos[0], y = pos[1];
+        return u[y][x];
     }
 
-    double value(std::vector<int>& x) {
-        return u[x[1]][x[0]];
-    }
-
-    bool is_outside(const std::vector<int>& x) {
-        return x[0] < 0 || x[1] < 0 || x[0] >= res_x || x[1] >= res_y;
+    bool is_outside(const std::vector<int>& pos) const {
+        int x = pos[0], y = pos[1];
+        return x < 0 || y < 0 || x >= int(res_x) || y >= int(res_y);
     }
 
     double h;
-    
-    std::vector<std::vector<double>> u;
-
+    std::vector<std::vector<double>> u; // u[y][x]
     unsigned int res_x;
     unsigned int res_y;
 };
@@ -270,6 +309,55 @@ double directional_first_derivative(Domain& u, std::vector<int>& x, std::vector<
     {
         return (u.value(t_eh_fwd) - u.value(x)) / (u.h);
     }
+}
+
+double dot_product(std::vector<int>& a, std::vector<int>& b) {
+    if (a.size() != b.size()) {
+        return 0.0;
+    }
+
+    double dot = 0.0;
+    for (int i = 0; i < a.size(); i++)
+    {
+        dot += a[i] * b[i];
+    }
+    
+    return dot;
+}
+
+double directional_upwind_gradient(Domain& u, std::vector<int>& x, std::vector<int>& e) {
+    // Unit basis directions
+    std::vector<int> e0  = {1, 0};
+    std::vector<int> e1  = {0, 1};
+    std::vector<int> e0_inv  = {-1, 0};
+    std::vector<int> e1_inv  = {0, -1};
+
+    double e_dot_e0 = dot_product(e, e0);
+    double e_dot_e1 = dot_product(e, e1);
+
+    double grad0_fwd = directional_first_derivative(u, x, e0);
+    double grad0_bwd = directional_first_derivative(u, x, e0_inv);
+
+    double grad1_fwd = directional_first_derivative(u, x, e1);
+    double grad1_bwd = directional_first_derivative(u, x, e1_inv);
+
+    double grad0 = 0.0;
+    if (e_dot_e0 < 0) {
+        if (!std::isinf(grad0_fwd)) grad0 += e_dot_e0 * grad0_fwd;
+    }
+    if (e_dot_e0 > 0) {
+        if (!std::isinf(grad0_bwd)) grad0 -= e_dot_e0 * grad0_bwd;
+    }
+
+    double grad1 = 0.0;
+    if (e_dot_e1 < 0) {
+        if (!std::isinf(grad1_fwd)) grad1 += e_dot_e1 * grad1_fwd;
+    }
+    if (e_dot_e1 > 0) {
+        if (!std::isinf(grad1_bwd)) grad1 -= e_dot_e1 * grad1_bwd;
+    }
+
+    return grad0 + grad1;
 }
 
 double closed_form_maximum(std::vector<int>& v1, std::vector<int>& v2, double m1, double m2, double b) {
@@ -304,7 +392,13 @@ double S_MA(Domain& u, std::vector<int>& x, double b) {
 
     //std::cout << "L1, L2 = " << L1 << ", " << L2 << std::endl;
 
-    return std::max(L1, L2);
+    double residual = std::max(L1, L2);
+
+    if (std::isnan(residual)) {
+        residual = -std::numeric_limits<double>::infinity();
+    }
+
+    return residual;
 }
 
 double support_function_square(const std::vector<int>& e,
@@ -315,59 +409,20 @@ double support_function_square(const std::vector<int>& e,
     return e[0]*hx + e[1]*hy;
 }
 
-double first_difference(Domain& U, int x, int y, std::vector<int>& e) {
-    std::vector<int> t_eh_fwd = {x + e[0], y + e[1]};
-    std::vector<int> pos = {x + e[0], y + e[1]};
-
-    if (U.is_outside(t_eh_fwd)) return std::numeric_limits<double>::infinity();
-    return (U.value(t_eh_fwd) - U.value(pos)) / U.h;
-}
-
-double laplacian_value_at(Domain& U, int x, int y) {
-    std::vector<int> pos = {x, y};
-    std::vector<int> ex = {1, 0};
-    std::vector<int> ey = {0, 1};
-
-    double d2x = directional_second_derivative(U, pos, ex);
-    double d2y = directional_second_derivative(U, pos, ey);
-
-    if (std::isinf(d2x) || std::isinf(d2y)) {
-        return std::numeric_limits<double>::infinity();
-    }
-    return d2x + d2y;
-}
-
-double S_BV2(Domain& u, const std::vector<int>& x) {
-    // Coordinate directions (positive and negative)
-    std::vector<std::vector<int>> dirs = {
-        {1, 0},   {-1, 0},   // x forward/backward
-        {0, 1},   {0, -1}    // y forward/backward
+double S_BV2(Domain& U, std::vector<int>& pos) {
+    // sample directions with Euclidean norm 1: axis and diagonals
+    std::vector<std::vector<int>> sample_dirs = {
+        {1,0}, {-1,0}, {0,1}, {0,-1},
     };
-
-    double residual = -std::numeric_limits<double>::infinity();
-
-    // Precompute Laplacian mask
-    double lap = laplacian_value_at(u, x[0], x[1]);
-
-    // Loop over axis pairs
-    for (int i = 0; i < dirs.size(); i += 2) {
-        double du_pos = first_difference(u, x[0], x[1], dirs[i]);     // forward
-        double du_neg = first_difference(u, x[0], x[1], dirs[i + 1]); // backward
-
-        double deriv = (du_pos - du_neg) / 2.0;
-
-        // Apply Laplacian mask: if lap = +inf, zero out deriv
-        if (!std::isfinite(lap)) {
-            deriv = 0.0;
-        }
-
-        // Support function of [0,1]^2 in this direction
-        double H = support_function_square(dirs[i], 0.0, 1.0, 0.0, 1.0);
-
-        residual = std::max(residual, deriv - H);
+    double residue = -std::numeric_limits<double>::infinity();
+    for (auto& e : sample_dirs) {
+        // normalize e length for sigma: but upwind_D_e uses integer e; here we treat sigma separately
+        double De = directional_upwind_gradient(U, pos, e);
+        double sigma = support_function_square(e, -0.5, 0.5, -0.5, 0.5); // if square target, compute differently
+        //sigma = 0.5;
+        residue = std::max(residue, De - sigma);
     }
-
-    return residual;
+    return residue;
 }
 
 void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector<double>>& image) {
@@ -376,38 +431,46 @@ void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector
 
         std::vector<std::vector<double>> new_u = u.u;
 
+        std::vector<std::vector<double>> r = u.u;
+        std::vector<std::vector<double>> d = u.u;
+
         for (int x = 0; x < u.res_x; x++) {
             for (int y = 0; y < u.res_y; y++) {
-                //bool on_boundary = (x == 0 || y == 0 || x == u.res_x-1 || y == u.res_y-1);
+                bool on_boundary = (x == 0 || y == 0 || x == u.res_x-1 || y == u.res_y-1);
 
                 std::vector<int> pos = {x,y};
-                double interior = S_MA(u, pos, image[x][y]);
-                double boundary = 0.0;//S_BV2(u, pos);
+                double interior = S_MA(u, pos, image[x][y] / (u.h * u.h));
+                double boundary = S_BV2(u, pos);
 
-                //if (on_boundary) {
-                //    boundary = S_BV2(u, pos);
-                //}
-
-                double res = std::max(interior, boundary);
+                double res = std::max(boundary, interior);
 
                 //std::cout << "res = " << res  << std::endl;
 
-                if (std::isnan(res)) {
-                    //new_u[y][x] = 0.0;
-                } else {
-                    new_u[y][x] -= tau * res;
-                }
+                //new_u[y][x] -= tau * res;
+
+                r[y][x] = res;
 
                 max_residual = std::max(max_residual, std::abs(res));
             }
         }
+
+        
+        subtractAverage(r);
+        poisson_solver(r, d, u.res_x, u.res_y, 1e6, 1e-6, 16);
+
+        for (int x = 0; x < u.res_x; x++) {
+            for (int y = 0; y < u.res_y; y++) {
+                new_u[y][x] += tau * d[y][x];
+            }
+        }
+        //*/
 
         u.u = new_u;
 
         std::cout << "Iter " << iter << " max residual = " << max_residual << std::endl;
         if (max_residual < 1e-6) break;
 
-        grid_to_image(scale_matrix_proportional(u.u, 0.0, 1.0), "./u.png");
+        //grid_to_image(scale_matrix_proportional(r, 0.0, 1.0), "./r.png");
     }
 }
 
@@ -424,18 +487,37 @@ void export_transported_pts(Domain& u) {
     // Generate points
     for (int i = 0; i < u.res_y; ++i) {
         for (int j = 0; j < u.res_x; ++j) {
-            double x = static_cast<double>(j) * 1.0 / (u.res_x - 1);
-            double y = static_cast<double>(i) * 1.0 / (u.res_y - 1);
+            double x = static_cast<double>(j) * 1.0 / (u.res_x);
+            double y = static_cast<double>(i) * 1.0 / (u.res_y);
 
             std::vector<int> pos = {j, i};
 
             double grad_x = 0.0;
             double grad_y = 0.0;
 
-            grad_x = (directional_first_derivative(u, pos, directions[0])
-                    - directional_first_derivative(u, pos, directions[2])) / 2.0;
-            grad_y = (directional_first_derivative(u, pos, directions[1])
-                    - directional_first_derivative(u, pos, directions[3])) / 2.0;
+            // asymetrical but seems correct (not actually sure) on the +x +y boundaries. the -x, -y boundaries lie on the origin,
+            //grad_x = directional_upwind_gradient(u, pos, directions[0]);
+            //grad_y = directional_upwind_gradient(u, pos, directions[1]);
+
+            // all four boundaries seem to show the same problem now. the boundary is exactly halfway between the origin and where it should be
+            //grad_x = (directional_upwind_gradient(u, pos, directions[0]) - directional_upwind_gradient(u, pos, directions[2])) / 2.0;
+            //grad_y = (directional_upwind_gradient(u, pos, directions[1]) - directional_upwind_gradient(u, pos, directions[3])) / 2.0;
+
+            if (j > 0 && j < u.res_x-1) {
+                grad_x = (u.u[i][j+1] - u.u[i][j-1]) / (2.0 * u.h);
+            } else if (j == 0) {
+                grad_x = (u.u[i][j+1] - u.u[i][j]) / u.h;
+            } else {
+                grad_x = (u.u[i][j] - u.u[i][j-1]) / u.h;
+            }
+
+            if (i > 0 && i < u.res_y-1) {
+                grad_y = (u.u[i+1][j] - u.u[i-1][j]) / (2.0 * u.h);
+            } else if (i == 0) {
+                grad_y = (u.u[i+1][j] - u.u[i][j]) / u.h;
+            } else {
+                grad_y = (u.u[i][j] - u.u[i-1][j]) / u.h;
+            }
 
             if (std::isinf(grad_x)) {
                 grad_x = 0.0;
@@ -445,7 +527,7 @@ void export_transported_pts(Domain& u) {
                 grad_y = 0.0;
             }
 
-            points.push_back({x + grad_x, y + grad_y, 0.0});
+            points.push_back({grad_x+0.5, grad_y+0.5, 0.0});
         }
     }
 
@@ -497,9 +579,14 @@ int main(int argc, char** argv) {
 	std::vector<std::vector<double>> pixels;
     image_to_grid(image, pixels);
 
+    normalizeImage(pixels);
+
     Domain u(pixels[0].size(), pixels.size());
 
-    solve(u, 500, 0.00003, pixels);
+    for (int i = 0; i < 10000; i++)
+    {
+        solve(u, 10, 0.00002, pixels);
+        export_transported_pts(u);
+    }
 
-    export_transported_pts(u);
 }
