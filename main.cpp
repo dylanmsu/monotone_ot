@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <limits>
 #include <vector>
 #include <cmath>
@@ -107,20 +108,6 @@ std::vector<std::vector<double>> scale_matrix_proportional(const std::vector<std
     return scaled_matrix;
 }
 
-void image_to_grid(const cimg_library::CImg<unsigned char>& image, std::vector<std::vector<double>>& image_grid) {
-    for (int i = 0; i < image.height(); ++i) {
-        std::vector<double> row;
-        for (int j = 0; j < image.width(); ++j) {
-			double r = image(i, j, 0) / 255.0; // Normalize R component
-			double g = image(i, j, 1) / 255.0; // Normalize G component
-			double b = image(i, j, 2) / 255.0; // Normalize B component
-			double value = (0.299 * r) + (0.587 * g) + (0.114 * b); // Calculate grayscale value using luminosity method
-            row.push_back(value);
-        }
-        image_grid.push_back(row);
-    }
-}
-
 void grid_to_image(const std::vector<std::vector<double>>& image_grid, const std::string& filename) {
     if (image_grid.empty()) {
         throw std::runtime_error("Image grid is empty.");
@@ -180,7 +167,7 @@ void grid_to_image(const std::vector<std::vector<double>>& image_grid, const std
     for (size_t y = 0; y < height; ++y) {
         row_pointers[y] = static_cast<png_bytep>(png_malloc(png, png_get_rowbytes(png, info)));
         for (size_t x = 0; x < width; ++x) {
-            double gray = image_grid[y][x];
+            double gray = image_grid[x][y];
             // Clamp the grayscale value to [0.0, 1.0]
             gray = std::max(0.0, std::min(gray, 1.0));
             png_byte value = static_cast<png_byte>(gray * 255.0);
@@ -203,6 +190,91 @@ void grid_to_image(const std::vector<std::vector<double>>& image_grid, const std
     fclose(fp);
 }
 
+void image_to_grid(const std::string& filename, std::vector<std::vector<double>>& image_grid) {
+    FILE* fp = fopen(filename.c_str(), "rb");
+    if (!fp) {
+        throw std::runtime_error("Failed to open PNG file.");
+    }
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(fp);
+        throw std::runtime_error("Failed to create PNG read struct.");
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, NULL, NULL);
+        fclose(fp);
+        throw std::runtime_error("Failed to create PNG info struct.");
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(fp);
+        throw std::runtime_error("Error during PNG read initialization.");
+    }
+
+    png_init_io(png, fp);
+    png_read_info(png, info);
+
+    int width = png_get_image_width(png, info);
+    int height = png_get_image_height(png, info);
+    png_byte color_type = png_get_color_type(png, info);
+    png_byte bit_depth = png_get_bit_depth(png, info);
+
+    if (bit_depth == 16) {
+        png_set_strip_16(png);
+    }
+
+    if (color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_palette_to_rgb(png);
+    }
+
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+        png_set_expand_gray_1_2_4_to_8(png);
+    }
+
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) {
+        png_set_tRNS_to_alpha(png);
+    }
+
+    png_set_expand(png);  // Expand palettes, grayscale, etc.
+    png_set_gray_to_rgb(png); // If grayscale, convert to RGB
+    png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER); // Only add alpha if missing
+
+
+    png_read_update_info(png, info);
+
+    std::vector<png_bytep> row_pointers(height);
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = (png_bytep)malloc(png_get_rowbytes(png, info));
+    }
+
+    png_read_image(png, row_pointers.data());
+
+    fclose(fp);
+
+    for (int i = 0; i < height; ++i) {
+        std::vector<double> row;
+        for (int j = 0; j < width; ++j) {
+            png_bytep px = &row_pointers[i][j * 4];
+            double r = px[0] / 255.0;
+            double g = px[1] / 255.0;
+            double b = px[2] / 255.0;
+            double gray = (0.299 * r) + (0.587 * g) + (0.114 * b);
+            row.push_back(gray);
+        }
+        image_grid.push_back(row);
+    }
+
+    for (int y = 0; y < height; y++) {
+        free(row_pointers[y]);
+    }
+
+    png_destroy_read_struct(&png, &info, NULL);
+}
+
 void normalizeImage(std::vector<std::vector<double>> &F) {
     double sum = 0.0;
 
@@ -212,6 +284,8 @@ void normalizeImage(std::vector<std::vector<double>> &F) {
             sum += val;
         }
     }
+
+    std::cout << "image integral = " << sum << std::endl;
 
     // Avoid division by zero
     if (sum == 0.0) {
@@ -255,12 +329,145 @@ void subtractAverage(std::vector<std::vector<double>>& raster) {
     }
 }
 
+void clamp(int &value, int min, int max) {
+    value = std::max(std::min(value, max), min);
+}
+
+// Bilinear interpolation function
+double bilinearInterpolation(const std::vector<std::vector<double>>& image, double x, double y) {
+    int x0 = floor(x);
+    int y0 = floor(y);
+    int x1 = ceil(x);
+    int y1 = ceil(y);
+
+    clamp(x0, 0, image[0].size() - 1);
+    clamp(x1, 0, image[0].size() - 1);
+    clamp(y0, 0, image.size() - 1);
+    clamp(y1, 0, image.size() - 1);
+
+    //if (x < 0 || y < 0 || x > image[0].size() || y > image.size()) {
+    //    return 0.0;
+    //}
+
+    // Check if the point is outside the image bounds
+    if (x0 < 0 || y0 < 0 || x1 >= image[0].size() || y1 >= image.size()) {
+        printf("interpolation out of range: x: %f, y: %f\r\n", x, y);
+
+        printf("x0: %i, y0: %i, x1: %i, y1: %i\r\n", x0, y0, x1, y1);
+        // Handle out-of-bounds condition
+        return 0.0;  // Default value
+    }
+
+    // Interpolate along x-axis
+    double fx1 = x - x0;
+    double fx0 = 1.0 - fx1;
+
+    // Interpolate along y-axis
+    double fy1 = y - y0;
+    double fy0 = 1.0 - fy1;
+
+    // Perform bilinear interpolation
+    double top = fx0 * image[y0][x0] + fx1 * image[y0][x1];
+    double bottom = fx0 * image[y1][x0] + fx1 * image[y1][x1];
+    return std::max(fy0 * top + fy1 * bottom, 1e-12);
+}
+
+std::vector<std::vector<double>> hammingResize(
+    const std::vector<std::vector<double>>& input_image,
+    int current_resolution,
+    int target_resolution)
+{
+    // Validate inputs
+    if (current_resolution <= 0 || target_resolution <= 0) {
+        return std::vector<std::vector<double>>(target_resolution,
+                                                std::vector<double>(target_resolution, 0.0));
+    }
+
+    if (input_image.size() != current_resolution ||
+        input_image[0].size() != current_resolution) {
+        return std::vector<std::vector<double>>(target_resolution,
+                                                std::vector<double>(target_resolution, 0.0));
+    }
+
+    if (current_resolution == target_resolution) {
+        return input_image;
+    }
+
+    std::vector<std::vector<double>> output_image(target_resolution,
+                                                  std::vector<double>(target_resolution, 0.0));
+
+    double scale = static_cast<double>(current_resolution) / static_cast<double>(target_resolution);
+    bool is_downscaling = scale > 1.0;
+    double filter_scale = is_downscaling ? scale : 1.0;
+    double support = 3.0 * filter_scale;
+
+    // Hamming windowed sinc kernel
+    auto hammingKernel = [filter_scale](double x) -> double {
+        x = std::abs(x);
+        double support = 3.0 * filter_scale;
+
+        if (x >= support) return 0.0;
+        if (x == 0.0) return 1.0;
+
+        double norm_x = x / filter_scale;
+        double pi_x = M_PI * norm_x;
+        double sinc = std::sin(pi_x) / pi_x;
+
+        double window_arg = M_PI * x / support;
+        double hamming_window = 0.54 + 0.46 * std::cos(window_arg);
+
+        return sinc * hamming_window;
+    };
+
+    // Safe pixel access
+    auto getPixel = [&](int x, int y) -> double {
+        x = std::max(0, std::min(x, current_resolution - 1));
+        y = std::max(0, std::min(y, current_resolution - 1));
+        return input_image[y][x];
+    };
+
+    for (int target_y = 0; target_y < target_resolution; ++target_y) {
+        for (int target_x = 0; target_x < target_resolution; ++target_x) {
+            double src_x = (target_x + 0.5) * scale - 0.5;
+            double src_y = (target_y + 0.5) * scale - 0.5;
+
+            double sum = 0.0;
+            double weight_sum = 0.0;
+
+            int x_start = static_cast<int>(std::floor(src_x - support));
+            int x_end = static_cast<int>(std::ceil(src_x + support));
+            int y_start = static_cast<int>(std::floor(src_y - support));
+            int y_end = static_cast<int>(std::ceil(src_y + support));
+
+            for (int sample_y = y_start; sample_y <= y_end; ++sample_y) {
+                for (int sample_x = x_start; sample_x <= x_end; ++sample_x) {
+                    double dx = src_x - sample_x;
+                    double dy = src_y - sample_y;
+
+                    double weight_x = hammingKernel(dx);
+                    double weight_y = hammingKernel(dy);
+                    double weight = weight_x * weight_y;
+
+                    if (std::abs(weight) > 1e-10) {
+                        sum += getPixel(sample_x, sample_y) * weight;
+                        weight_sum += weight;
+                    }
+                }
+            }
+
+            output_image[target_y][target_x] = (weight_sum > 0.0) ? sum / weight_sum : 0.0;
+        }
+    }
+
+    return output_image;
+}
+
 class Domain {
 public:
     Domain(unsigned int res_x, unsigned int res_y)
     : res_x(res_x), res_y(res_y)
     {
-        // store as u[row][col] == u[y][x]
+        // store as u[row][col] == u[x][y]
         u.assign(res_y, std::vector<double>(res_x, 0.0));
 
         // if domain mapped to [0,1] in x, spacing is 1/(N-1)
@@ -270,7 +477,7 @@ public:
 
     double value(const std::vector<int>& pos) const {
         int x = pos[0], y = pos[1];
-        return u[y][x];
+        return u[x][y];
     }
 
     bool is_outside(const std::vector<int>& pos) const {
@@ -279,10 +486,29 @@ public:
     }
 
     double h;
-    std::vector<std::vector<double>> u; // u[y][x]
+    std::vector<std::vector<double>> u; // u[x][y]
     unsigned int res_x;
     unsigned int res_y;
 };
+
+class MA_Residual
+{
+private:
+    Domain u;
+public:
+    MA_Residual(unsigned int resolution_x, unsigned int resolution_y);
+    ~MA_Residual();
+};
+
+MA_Residual::MA_Residual(unsigned int resolution_x, unsigned int resolution_y)
+    :u(resolution_x, resolution_y)
+{
+}
+
+MA_Residual::~MA_Residual()
+{
+}
+
 
 double directional_second_derivative(Domain& u, std::vector<int>& x, std::vector<int>& e) {
     std::vector<int> t_eh_fwd = {x[0] + e[0], x[1] + e[1]};
@@ -307,7 +533,7 @@ double directional_first_derivative(Domain& u, std::vector<int>& x, std::vector<
     }
     else
     {
-        return (u.value(t_eh_fwd) - u.value(x)) / (u.h);
+        return ((u.value(t_eh_fwd) - u.value(x)) / (u.h));
     }
 }
 
@@ -357,7 +583,7 @@ double directional_upwind_gradient(Domain& u, std::vector<int>& x, std::vector<i
         if (!std::isinf(grad1_bwd)) grad1 -= e_dot_e1 * grad1_bwd;
     }
 
-    return grad0 + grad1;
+    return (grad0 + grad1) / std::sqrt(e[0]*e[0] + e[1]*e[1]);
 }
 
 double closed_form_maximum(std::vector<int>& v1, std::vector<int>& v2, double m1, double m2, double b) {
@@ -368,36 +594,62 @@ double closed_form_maximum(std::vector<int>& v1, std::vector<int>& v2, double m1
     return root - m1/(2.0*norm1) - m2/(2.0*norm2);
 }
 
-double S_MA(Domain& u, std::vector<int>& x, double b) {
-    std::vector<double> derivatives(4);
-    std::vector<std::vector<int>> directions = {
-        {0, 1},
-        {1, 0},
-        {1, 1},
-        {1, -1}
-    };
+std::vector<std::vector<int>> generate_directions(int radius) {
+    std::vector<std::vector<int>> dirs;
+    for (int i=-radius; i<=radius; ++i)
+    {
+        for (int j=-radius; j<=radius; ++j)
+        {
+            if (i==0 && j==0) {
+                continue;
+            }
 
-    derivatives[0] = directional_second_derivative(u, x, directions[0]);
-    derivatives[1] = directional_second_derivative(u, x, directions[1]);
-    derivatives[2] = directional_second_derivative(u, x, directions[2]);
-    derivatives[3] = directional_second_derivative(u, x, directions[3]);
+            // primitive directions only
+            if (std::gcd(i,j) != 1) {
+                continue;
+            }
 
-    //std::cout << "derivatives[0] = " << derivatives[0] << std::endl;
-    //std::cout << "derivatives[1] = " << derivatives[1] << std::endl;
-    //std::cout << "derivatives[2] = " << derivatives[2] << std::endl;
-    //std::cout << "derivatives[3] = " << derivatives[3] << std::endl;
+            dirs.push_back({i,j});
+        }
+    }
+    return dirs;
+}
 
-    double L1 = closed_form_maximum(directions[1], directions[0], derivatives[1], derivatives[0], b);
-    double L2 = closed_form_maximum(directions[2], directions[3], derivatives[2], derivatives[3], b);
+std::vector<std::pair<int,int>> generate_bases(const std::vector<std::vector<int>>& dirs) {
+    std::vector<std::pair<int,int>> bases;
+    for (size_t i=0; i<dirs.size(); ++i)
+    {
+        for (size_t j=i+1; j<dirs.size(); ++j)
+        {
+            int det = dirs[i][0]*dirs[j][1] - dirs[i][1]*dirs[j][0];
 
-    //std::cout << "L1, L2 = " << L1 << ", " << L2 << std::endl;
+            if (std::abs(det) == 1) {
+                bases.emplace_back(i,j);
+            }
+        }
+    }
+    return bases;
+}
 
-    double residual = std::max(L1, L2);
+double S_MA(Domain& u, const std::vector<int>& x, double b, const std::vector<std::vector<int>>& dirs, const std::vector<std::pair<int,int>>& bases) {
+    std::vector<double> derivatives(dirs.size());
+    for (size_t k = 0; k < dirs.size(); ++k) {
+        derivatives[k] = directional_second_derivative(u, const_cast<std::vector<int>&>(x), 
+                                                       const_cast<std::vector<int>&>(dirs[k]));
+    }
+
+    double residual = -std::numeric_limits<double>::infinity();
+
+    for (auto [i,j] : bases) {
+        double val = closed_form_maximum(const_cast<std::vector<int>&>(dirs[i]),
+                                         const_cast<std::vector<int>&>(dirs[j]),
+                                         derivatives[i], derivatives[j], b);
+        residual = std::max(residual, val);
+    }
 
     if (std::isnan(residual)) {
         residual = -std::numeric_limits<double>::infinity();
     }
-
     return residual;
 }
 
@@ -409,100 +661,52 @@ double support_function_square(const std::vector<int>& e,
     return e[0]*hx + e[1]*hy;
 }
 
-double S_BV2(Domain& U, std::vector<int>& pos) {
-    // sample directions with Euclidean norm 1: axis and diagonals
-    std::vector<std::vector<int>> sample_dirs = {
-        {1,0}, {-1,0}, {0,1}, {0,-1},
-    };
+double S_BV2(Domain& U, std::vector<int>& pos, const std::vector<std::vector<int>>& dirs) {
     double residue = -std::numeric_limits<double>::infinity();
-    for (auto& e : sample_dirs) {
-        // normalize e length for sigma: but upwind_D_e uses integer e; here we treat sigma separately
-        double De = directional_upwind_gradient(U, pos, e);
-        double sigma = support_function_square(e, -0.5, 0.5, -0.5, 0.5); // if square target, compute differently
-        //sigma = 0.5;
+    for (auto& e : dirs) {
+        double De = directional_upwind_gradient(U, pos, const_cast<std::vector<int>&>(e));
+        double sigma = 0.5;
         residue = std::max(residue, De - sigma);
     }
     return residue;
 }
 
-void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector<double>>& image) {
-    for (unsigned int iter = 0; iter < max_iter; iter++) {
-        double max_residual = 0.0;
-
-        std::vector<std::vector<double>> new_u = u.u;
-
-        std::vector<std::vector<double>> r = u.u;
-        std::vector<std::vector<double>> d = u.u;
-
-        for (int x = 0; x < u.res_x; x++) {
-            for (int y = 0; y < u.res_y; y++) {
-                bool on_boundary = (x == 0 || y == 0 || x == u.res_x-1 || y == u.res_y-1);
-
-                std::vector<int> pos = {x,y};
-                double interior = S_MA(u, pos, image[x][y] / (u.h * u.h));
-                double boundary = S_BV2(u, pos);
-
-                double res = std::max(boundary, interior);
-
-                //std::cout << "res = " << res  << std::endl;
-
-                //new_u[y][x] -= tau * res;
-
-                r[y][x] = res;
-
-                max_residual = std::max(max_residual, std::abs(res));
-            }
+double compute_residual(Domain& u,
+                        const std::vector<std::vector<double>>& image,
+                        const std::vector<std::vector<int>>& dirs,
+                        const std::vector<std::pair<int,int>>& bases,
+                        std::vector<std::vector<double>>& r_out)
+{
+    double residual = 0.0;
+    for (int x = 0; x < u.res_x; x++) {
+        for (int y = 0; y < u.res_y; y++) {
+            std::vector<int> pos = {x, y};
+            double area_ratio = (std::sqrt(2) - 1) * 2.0;
+            //double area_ratio = 3.141592 / 4;
+            //double area_ratio = 0.5;
+            double interior = S_MA(u, pos, image[x][y] * u.res_x * u.res_y * area_ratio, dirs, bases);
+            double boundary = S_BV2(u, pos, dirs) * 20.0;
+            double res = std::max(boundary, interior);
+            r_out[x][y] = res;
+            residual += res * res;
         }
-
-        
-        subtractAverage(r);
-        poisson_solver(r, d, u.res_x, u.res_y, 1e6, 1e-6, 16);
-
-        for (int x = 0; x < u.res_x; x++) {
-            for (int y = 0; y < u.res_y; y++) {
-                new_u[y][x] += tau * d[y][x];
-            }
-        }
-        //*/
-
-        u.u = new_u;
-
-        std::cout << "Iter " << iter << " max residual = " << max_residual << std::endl;
-        if (max_residual < 1e-6) break;
-
-        //grid_to_image(scale_matrix_proportional(r, 0.0, 1.0), "./r.png");
     }
+
+    return residual / u.res_x * u.res_y;
 }
 
 void export_transported_pts(Domain& u) {
     std::vector<std::vector<double>> points;
 
-    std::vector<std::vector<int>> directions = {
-        {1, 0},
-        {0, 1},
-        {-1, 0},
-        {0, -1},
-    };
-
     // Generate points
     for (int i = 0; i < u.res_y; ++i) {
         for (int j = 0; j < u.res_x; ++j) {
-            double x = static_cast<double>(j) * 1.0 / (u.res_x);
-            double y = static_cast<double>(i) * 1.0 / (u.res_y);
-
             std::vector<int> pos = {j, i};
 
             double grad_x = 0.0;
             double grad_y = 0.0;
 
-            // asymetrical but seems correct (not actually sure) on the +x +y boundaries. the -x, -y boundaries lie on the origin,
-            //grad_x = directional_upwind_gradient(u, pos, directions[0]);
-            //grad_y = directional_upwind_gradient(u, pos, directions[1]);
-
-            // all four boundaries seem to show the same problem now. the boundary is exactly halfway between the origin and where it should be
-            //grad_x = (directional_upwind_gradient(u, pos, directions[0]) - directional_upwind_gradient(u, pos, directions[2])) / 2.0;
-            //grad_y = (directional_upwind_gradient(u, pos, directions[1]) - directional_upwind_gradient(u, pos, directions[3])) / 2.0;
-
+            // compute x gradient
             if (j > 0 && j < u.res_x-1) {
                 grad_x = (u.u[i][j+1] - u.u[i][j-1]) / (2.0 * u.h);
             } else if (j == 0) {
@@ -511,6 +715,7 @@ void export_transported_pts(Domain& u) {
                 grad_x = (u.u[i][j] - u.u[i][j-1]) / u.h;
             }
 
+            // compute y gradient
             if (i > 0 && i < u.res_y-1) {
                 grad_y = (u.u[i+1][j] - u.u[i-1][j]) / (2.0 * u.h);
             } else if (i == 0) {
@@ -535,6 +740,45 @@ void export_transported_pts(Domain& u) {
     export_grid_to_svg(points, 1.0, 1.0, u.res_x, u.res_y, "./grid.svg", 1.0);
 }
 
+void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector<double>>& image) {
+    std::vector<std::vector<double>> r = u.u;
+    std::vector<std::vector<double>> d = u.u;
+
+    const std::vector<std::vector<int>> dirs = generate_directions(3);
+    const std::vector<std::pair<int,int>> bases = generate_bases(dirs);
+
+    double prev_residual = 0.0;
+    
+    for (unsigned int iter = 0; iter < max_iter; iter++) {
+        double residual = 0.0;
+
+        std::vector<std::vector<double>> new_u = u.u;
+
+        residual = compute_residual(u, image, dirs, bases, r);
+        
+        subtractAverage(r);
+        poisson_solver(r, d, u.res_x, u.res_y, 1e6, 1e-6, 16);
+
+        for (int x = 0; x < u.res_x; x++) {
+            for (int y = 0; y < u.res_y; y++) {
+                new_u[x][y] += tau * d[x][y];
+            }
+        }
+
+        u.u = new_u;
+
+        std::cout << "Iter " << iter << " max residual = " << residual << ", change = " << prev_residual - residual << std::endl;
+        if (std::abs(prev_residual - residual) < 0.001) break;
+
+        if (iter % 10 == 0) {
+            export_transported_pts(u);
+        }
+
+        prev_residual = residual;
+    }
+}
+//*/
+
 int main(int argc, char** argv) {
     std::vector<std::vector<double>> S_MABV2;
 
@@ -543,6 +787,7 @@ int main(int argc, char** argv) {
     args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
 
     args::ValueFlag<std::string>    input_png(parser, "image", "Image input", {"input_png"});
+    args::ValueFlag<unsigned int>   resolution(parser, "resolution", "Resolution", {"res_w"});
     
     try
     {
@@ -569,24 +814,25 @@ int main(int argc, char** argv) {
     std::string image_filename = "";
 
     bool output_progress = false;
+    unsigned int res_w = 100;
 
     if (input_png) { 
         image_filename = args::get(input_png);
     }
 
-    cimg_library::CImg<unsigned char> image(image_filename.c_str());
+    if (resolution) {
+        res_w = args::get(resolution);
+    }
 
 	std::vector<std::vector<double>> pixels;
-    image_to_grid(image, pixels);
+    image_to_grid(image_filename.c_str(), pixels);
+    //pixels = scale_matrix_proportional(pixels, 0.0, 1.0);
+    pixels = hammingResize(pixels, pixels[0].size(), res_w);
 
     normalizeImage(pixels);
 
+
     Domain u(pixels[0].size(), pixels.size());
 
-    for (int i = 0; i < 10000; i++)
-    {
-        solve(u, 10, 0.00002, pixels);
-        export_transported_pts(u);
-    }
-
+    solve(u, 10000, 1.0 / (u.res_x * u.res_y), pixels);
 }
