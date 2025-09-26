@@ -36,12 +36,21 @@ endif()
 include_directories(src)
 include_directories(extern)
 include_directories(extern/eigen/)
+include_directories(extern/cppad/include)
+
+find_package(Ceres REQUIRED)
+include_directories(${CERES_INCLUDE_DIRS})
+
+add_subdirectory(extern/cppad)
 
 set(PROJECT_SOURCES
     main.cpp
+    src/bvh.cpp
     src/poisson_solver.cpp
+    src/mesh.cpp
+    src/normal_integration/normal_integration.cpp
 )
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
 
-target_link_libraries(${PROJECT_NAME} PRIVATE ${ALLLIBS})
+target_link_libraries(${PROJECT_NAME} PRIVATE ${ALLLIBS} ${CERES_LIBRARIES})

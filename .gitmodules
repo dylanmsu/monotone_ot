@@ -7,3 +7,6 @@
 [submodule "extern/args"]
 	path = extern/args
 	url = https://github.com/Taywee/args.git
+[submodule "extern/cppad"]
+	path = extern/cppad
+	url = git@github.com:coin-or/CppAD.git

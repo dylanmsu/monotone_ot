@@ -2,15 +2,22 @@
 #include <iostream>
 #include <numeric>
 #include <limits>
+#include <deque>
 #include <vector>
 #include <cmath>
 
 #include <png.h>
 
+#include "cppad/cppad.hpp"
 #include "args/args.hxx"
 #include "cimg/CImg.h"
 
+#include "mesh.h"
 #include "poisson_solver.h"
+
+#include "monge_ampere/domain.h"
+#include "monge_ampere/monge_ampere_solver.h"
+#include "normal_integration/normal_integration.h"
 
 void export_grid_to_svg(std::vector<std::vector<double>> &points, double width, double height, int res_x, int res_y, std::string filename, double stroke_width) {
     std::ofstream svg_file(filename, std::ios::out);
@@ -275,31 +282,103 @@ void image_to_grid(const std::string& filename, std::vector<std::vector<double>>
     png_destroy_read_struct(&png, &info, NULL);
 }
 
-void normalizeImage(std::vector<std::vector<double>> &F) {
-    double sum = 0.0;
+std::vector<std::vector<double>> apply_inverse_map(
+    Mesh& tmap, 
+    std::vector<std::vector<double>>& input_pts
+) {
 
-    // First, compute the total sum (integral)
-    for (const auto &row : F) {
-        for (double val : row) {
-            sum += val;
+    std::vector<std::vector<double>> unit_points;
+
+    for (int i = 0; i < tmap.res_y; ++i) {
+        for (int j = 0; j < tmap.res_x; ++j) {
+            double x = static_cast<double>(j) * 1.0 / (tmap.res_x - 1);
+            double y = static_cast<double>(i) * 1.0 / (tmap.res_y - 1);
+            unit_points.push_back({x, y, 0.0});
+        }
+    }
+    
+    // Build BVH over transported (target) points
+    tmap.build_bvh(5, 30);
+
+    std::vector<std::vector<double>> inverted_points;
+    inverted_points.reserve(input_pts.size());
+
+    for (size_t i = 0; i < input_pts.size(); ++i) {
+        std::vector<Hit> hits;
+        bool intersection = false;
+
+        // Query input point against target BVH
+        tmap.bvh->query(input_pts[i], hits, intersection);
+
+        if (intersection && !hits.empty()) {
+            const auto& tri = tmap.triangles[hits[0].face_id];
+
+            // Get source triangle vertices
+            const auto& v0 = unit_points[tri[0]];
+            const auto& v1 = unit_points[tri[1]];
+            const auto& v2 = unit_points[tri[2]];
+
+            // Barycentric weights from target query
+            double b0 = hits[0].barycentric_coords[0];
+            double b1 = hits[0].barycentric_coords[1];
+            double b2 = hits[0].barycentric_coords[2];
+
+            // Interpolate in source domain
+            double interpolation_x = v0[0]*b0 + v1[0]*b1 + v2[0]*b2;
+            double interpolation_y = v0[1]*b0 + v1[1]*b1 + v2[1]*b2;
+
+            inverted_points.push_back({interpolation_x, interpolation_y});
+        } else {
+            // No intersection → fallback: copy input
+            inverted_points.push_back(input_pts[i]);
         }
     }
 
-    std::cout << "image integral = " << sum << std::endl;
+    return inverted_points;
+}
 
-    // Avoid division by zero
-    if (sum == 0.0) {
-        std::cerr << "Error: Integral (sum) is zero, cannot normalize." << std::endl;
+void translatePoints(std::vector<std::vector<double>>& trg_pts, std::vector<double> position_xyz) {
+  for (int i = 0; i < trg_pts.size(); i++)
+  {
+    trg_pts[i][0] += position_xyz[0];
+    trg_pts[i][1] += position_xyz[1];
+    trg_pts[i][2] += position_xyz[2];
+  }
+}
+
+void normalizeImage(std::vector<std::vector<double>> &F, double width, double height) {
+    int Nx = F.size();                  // number of rows
+    if (Nx == 0) return;
+    int Ny = F[0].size();               // number of columns
+
+    double dx = width / Ny;             // pixel width
+    double dy = height / Nx;            // pixel height
+    double dA = dx * dy;                // pixel area
+
+    double integral = 0.0;
+
+    // Compute integral using Riemann sum
+    for (const auto &row : F) {
+        for (double val : row) {
+            integral += val * dA;
+        }
+    }
+
+    std::cout << "image integral = " << integral << std::endl;
+
+    if (integral == 0.0) {
+        std::cerr << "Error: Integral is zero, cannot normalize." << std::endl;
         return;
     }
 
-    // Normalize each value
+    // Normalize so the integral becomes 1
     for (auto &row : F) {
         for (double &val : row) {
-            val /= sum;
+            val /= integral;
         }
     }
 }
+
 
 void subtractAverage(std::vector<std::vector<double>>& raster) {
     // Calculate the average of the raster
@@ -327,49 +406,6 @@ void subtractAverage(std::vector<std::vector<double>>& raster) {
             }
         });
     }
-}
-
-void clamp(int &value, int min, int max) {
-    value = std::max(std::min(value, max), min);
-}
-
-// Bilinear interpolation function
-double bilinearInterpolation(const std::vector<std::vector<double>>& image, double x, double y) {
-    int x0 = floor(x);
-    int y0 = floor(y);
-    int x1 = ceil(x);
-    int y1 = ceil(y);
-
-    clamp(x0, 0, image[0].size() - 1);
-    clamp(x1, 0, image[0].size() - 1);
-    clamp(y0, 0, image.size() - 1);
-    clamp(y1, 0, image.size() - 1);
-
-    //if (x < 0 || y < 0 || x > image[0].size() || y > image.size()) {
-    //    return 0.0;
-    //}
-
-    // Check if the point is outside the image bounds
-    if (x0 < 0 || y0 < 0 || x1 >= image[0].size() || y1 >= image.size()) {
-        printf("interpolation out of range: x: %f, y: %f\r\n", x, y);
-
-        printf("x0: %i, y0: %i, x1: %i, y1: %i\r\n", x0, y0, x1, y1);
-        // Handle out-of-bounds condition
-        return 0.0;  // Default value
-    }
-
-    // Interpolate along x-axis
-    double fx1 = x - x0;
-    double fx0 = 1.0 - fx1;
-
-    // Interpolate along y-axis
-    double fy1 = y - y0;
-    double fy0 = 1.0 - fy1;
-
-    // Perform bilinear interpolation
-    double top = fx0 * image[y0][x0] + fx1 * image[y0][x1];
-    double bottom = fx0 * image[y1][x0] + fx1 * image[y1][x1];
-    return std::max(fy0 * top + fy1 * bottom, 1e-12);
 }
 
 std::vector<std::vector<double>> hammingResize(
@@ -462,299 +498,162 @@ std::vector<std::vector<double>> hammingResize(
     return output_image;
 }
 
-class Domain {
-public:
-    Domain(unsigned int res_x, unsigned int res_y)
-    : res_x(res_x), res_y(res_y)
-    {
-        // store as u[row][col] == u[x][y]
-        u.assign(res_y, std::vector<double>(res_x, 0.0));
-
-        // if domain mapped to [0,1] in x, spacing is 1/(N-1)
-        // if you map to [-1,1] use 2.0/(res_x-1)
-        h = 1.0 / double(res_x - 1);
+std::vector<double> normalize_vec(std::vector<double> p1) {
+    std::vector<double> vec(3);
+    double squared_len = 0;
+    for (int i=0; i<p1.size(); i++) {
+        squared_len += p1[i] * p1[i];
     }
 
-    double value(const std::vector<int>& pos) const {
-        int x = pos[0], y = pos[1];
-        return u[x][y];
+    double len = std::sqrt(squared_len);
+
+    for (int i=0; i<p1.size(); i++) {
+        vec[i] = p1[i] / len;
     }
 
-    bool is_outside(const std::vector<int>& pos) const {
-        int x = pos[0], y = pos[1];
-        return x < 0 || y < 0 || x >= int(res_x) || y >= int(res_y);
-    }
-
-    double h;
-    std::vector<std::vector<double>> u; // u[x][y]
-    unsigned int res_x;
-    unsigned int res_y;
-};
-
-class MA_Residual
-{
-private:
-    Domain u;
-public:
-    MA_Residual(unsigned int resolution_x, unsigned int resolution_y);
-    ~MA_Residual();
-};
-
-MA_Residual::MA_Residual(unsigned int resolution_x, unsigned int resolution_y)
-    :u(resolution_x, resolution_y)
-{
+    return vec;
 }
 
-MA_Residual::~MA_Residual()
-{
-}
+//compute the desired normals
+std::vector<std::vector<double>> fresnelMapping(
+  std::vector<std::vector<double>> &vertices, 
+  std::vector<std::vector<double>> &target_pts, 
+  double refractive_index
+) {
+    std::vector<std::vector<double>> desiredNormals;
 
+    //double boundary_z = -0.1;
 
-double directional_second_derivative(Domain& u, std::vector<int>& x, std::vector<int>& e) {
-    std::vector<int> t_eh_fwd = {x[0] + e[0], x[1] + e[1]};
-    std::vector<int> t_eh_bwd = {x[0] - e[0], x[1] - e[1]};
+    //vector<std::vector<double>> boundary_points;
 
-    if (u.is_outside(t_eh_fwd) || u.is_outside(t_eh_bwd))
-    {
-        return std::numeric_limits<double>::infinity();
-    }
-    else
-    {
-        return (u.value(t_eh_fwd) + u.value(t_eh_bwd) - 2.0 * u.value(x)) / (u.h * u.h);
-    }
-}
+    bool use_point_src = false;
+    bool use_reflective_caustics = false;
 
-double directional_first_derivative(Domain& u, std::vector<int>& x, std::vector<int>& e) {
-    std::vector<int> t_eh_fwd = {x[0] + e[0], x[1] + e[1]};
+    std::vector<double> pointLightPosition(3);
+    pointLightPosition[0] = 0.5;
+    pointLightPosition[1] = 0.5;
+    pointLightPosition[2] = 0.5;
 
-    if (u.is_outside(t_eh_fwd))
-    {
-        return std::numeric_limits<double>::infinity();
-    }
-    else
-    {
-        return ((u.value(t_eh_fwd) - u.value(x)) / (u.h));
-    }
-}
+    // place initial points on the refractive surface where the light rays enter the material
+    /*if (use_point_src && !use_reflective_caustics) {
+        for(int i = 0; i < vertices.size(); i++) {
+            std::vector<double> boundary_point(3);
 
-double dot_product(std::vector<int>& a, std::vector<int>& b) {
-    if (a.size() != b.size()) {
-        return 0.0;
-    }
-
-    double dot = 0.0;
-    for (int i = 0; i < a.size(); i++)
-    {
-        dot += a[i] * b[i];
-    }
-    
-    return dot;
-}
-
-double directional_upwind_gradient(Domain& u, std::vector<int>& x, std::vector<int>& e) {
-    // Unit basis directions
-    std::vector<int> e0  = {1, 0};
-    std::vector<int> e1  = {0, 1};
-    std::vector<int> e0_inv  = {-1, 0};
-    std::vector<int> e1_inv  = {0, -1};
-
-    double e_dot_e0 = dot_product(e, e0);
-    double e_dot_e1 = dot_product(e, e1);
-
-    double grad0_fwd = directional_first_derivative(u, x, e0);
-    double grad0_bwd = directional_first_derivative(u, x, e0_inv);
-
-    double grad1_fwd = directional_first_derivative(u, x, e1);
-    double grad1_bwd = directional_first_derivative(u, x, e1_inv);
-
-    double grad0 = 0.0;
-    if (e_dot_e0 < 0) {
-        if (!std::isinf(grad0_fwd)) grad0 += e_dot_e0 * grad0_fwd;
-    }
-    if (e_dot_e0 > 0) {
-        if (!std::isinf(grad0_bwd)) grad0 -= e_dot_e0 * grad0_bwd;
-    }
-
-    double grad1 = 0.0;
-    if (e_dot_e1 < 0) {
-        if (!std::isinf(grad1_fwd)) grad1 += e_dot_e1 * grad1_fwd;
-    }
-    if (e_dot_e1 > 0) {
-        if (!std::isinf(grad1_bwd)) grad1 -= e_dot_e1 * grad1_bwd;
-    }
-
-    return (grad0 + grad1) / std::sqrt(e[0]*e[0] + e[1]*e[1]);
-}
-
-double closed_form_maximum(std::vector<int>& v1, std::vector<int>& v2, double m1, double m2, double b) {
-    double norm1 = v1[0]*v1[0] + v1[1]*v1[1];
-    double norm2 = v2[0]*v2[0] + v2[1]*v2[1];
-    double term = (m1/(2.0*norm1) - m2/(2.0*norm2));
-    double root = std::sqrt(b/(norm1*norm2) + term*term);
-    return root - m1/(2.0*norm1) - m2/(2.0*norm2);
-}
-
-std::vector<std::vector<int>> generate_directions(int radius) {
-    std::vector<std::vector<int>> dirs;
-    for (int i=-radius; i<=radius; ++i)
-    {
-        for (int j=-radius; j<=radius; ++j)
-        {
-            if (i==0 && j==0) {
-                continue;
-            }
-
-            // primitive directions only
-            if (std::gcd(i,j) != 1) {
-                continue;
-            }
-
-            dirs.push_back({i,j});
+            // ray to plane intersection to get the initial points
+            double t = ((boundary_z - pointLightPosition[2]) / (vertices[i][2] - pointLightPosition[2]));
+            boundary_point[0] = pointLightPosition[0] + t*(vertices[i][0] - pointLightPosition[0]);
+            boundary_point[1] = pointLightPosition[1] + t*(vertices[i][1] - pointLightPosition[1]);
+            boundary_point[2] = boundary_z;
+            boundary_points.push_back(boundary_point);
         }
-    }
-    return dirs;
-}
+    }*/
 
-std::vector<std::pair<int,int>> generate_bases(const std::vector<std::vector<int>>& dirs) {
-    std::vector<std::pair<int,int>> bases;
-    for (size_t i=0; i<dirs.size(); ++i)
-    {
-        for (size_t j=i+1; j<dirs.size(); ++j)
-        {
-            int det = dirs[i][0]*dirs[j][1] - dirs[i][1]*dirs[j][0];
+    // run gradient descent on the boundary points to find their optimal positions such that they satisfy Fermat's principle
+    /*if (!use_reflective_caustics && use_point_src) {
+        for (int i=0; i<boundary_points.size(); i++) {
+            for (int iteration=0; iteration<100000; iteration++) {
+                double grad_x;
+                double grad_y;
+                gradient(pointLightPosition, boundary_points[i], vertices[i], 1.0, refractive_index, grad_x, grad_y);
 
-            if (std::abs(det) == 1) {
-                bases.emplace_back(i,j);
+                boundary_points[i][0] -= 0.1 * grad_x;
+                boundary_points[i][1] -= 0.1 * grad_y;
+
+                // if magintude of both is low enough
+                if (grad_x*grad_x + grad_y*grad_y < 0.000001) {
+                    break;
+                }
             }
         }
-    }
-    return bases;
-}
+    }*/
 
-double S_MA(Domain& u, const std::vector<int>& x, double b, const std::vector<std::vector<int>>& dirs, const std::vector<std::pair<int,int>>& bases) {
-    std::vector<double> derivatives(dirs.size());
-    for (size_t k = 0; k < dirs.size(); ++k) {
-        derivatives[k] = directional_second_derivative(u, const_cast<std::vector<int>&>(x), 
-                                                       const_cast<std::vector<int>&>(dirs[k]));
-    }
+    for(int i = 0; i < vertices.size(); i++) {
+        std::vector<double> incidentLight(3);
+        std::vector<double> transmitted = {
+            target_pts[i][0] - vertices[i][0],
+            target_pts[i][1] - vertices[i][1],
+            target_pts[i][2] - vertices[i][2]
+        };
 
-    double residual = -std::numeric_limits<double>::infinity();
-
-    for (auto [i,j] : bases) {
-        double val = closed_form_maximum(const_cast<std::vector<int>&>(dirs[i]),
-                                         const_cast<std::vector<int>&>(dirs[j]),
-                                         derivatives[i], derivatives[j], b);
-        residual = std::max(residual, val);
-    }
-
-    if (std::isnan(residual)) {
-        residual = -std::numeric_limits<double>::infinity();
-    }
-    return residual;
-}
-
-double support_function_square(const std::vector<int>& e,
-                            double xmin, double xmax,
-                            double ymin, double ymax) {
-    double hx = (e[0] >= 0 ? xmax : xmin);
-    double hy = (e[1] >= 0 ? ymax : ymin);
-    return e[0]*hx + e[1]*hy;
-}
-
-double S_BV2(Domain& U, std::vector<int>& pos, const std::vector<std::vector<int>>& dirs) {
-    double residue = -std::numeric_limits<double>::infinity();
-    for (auto& e : dirs) {
-        double De = directional_upwind_gradient(U, pos, const_cast<std::vector<int>&>(e));
-        double sigma = 0.5;
-        residue = std::max(residue, De - sigma);
-    }
-    return residue;
-}
-
-double compute_residual(Domain& u,
-                        const std::vector<std::vector<double>>& image,
-                        const std::vector<std::vector<int>>& dirs,
-                        const std::vector<std::pair<int,int>>& bases,
-                        std::vector<std::vector<double>>& r_out)
-{
-    double residual = 0.0;
-    for (int x = 0; x < u.res_x; x++) {
-        for (int y = 0; y < u.res_y; y++) {
-            std::vector<int> pos = {x, y};
-            double area_ratio = (std::sqrt(2) - 1) * 2.0;
-            //double area_ratio = 3.141592 / 4;
-            //double area_ratio = 0.5;
-            double interior = S_MA(u, pos, image[x][y] * u.res_x * u.res_y * area_ratio, dirs, bases);
-            double boundary = S_BV2(u, pos, dirs) * 20.0;
-            double res = std::max(boundary, interior);
-            r_out[x][y] = res;
-            residual += res * res;
+        if (use_point_src) {
+            incidentLight[0] = vertices[i][0] - pointLightPosition[0];
+            incidentLight[1] = vertices[i][1] - pointLightPosition[1];
+            incidentLight[2] = vertices[i][2] - pointLightPosition[2];
+        } else {
+            incidentLight[0] = 0;
+            incidentLight[1] = 0;
+            incidentLight[2] = -1;
         }
+
+        transmitted = normalize_vec(transmitted);
+        incidentLight = normalize_vec(incidentLight);
+
+        std::vector<double> normal(3);
+        if (use_reflective_caustics) {
+            normal[0] = ((transmitted[0]) + incidentLight[0]) * 1.0f;
+            normal[1] = ((transmitted[1]) + incidentLight[1]) * 1.0f;
+            normal[2] = ((transmitted[2]) + incidentLight[2]) * 1.0f;
+        } else {
+            normal[0] = ((transmitted[0]) - (incidentLight[0]) * refractive_index) * -1.0f;
+            normal[1] = ((transmitted[1]) - (incidentLight[1]) * refractive_index) * -1.0f;
+            normal[2] = ((transmitted[2]) - (incidentLight[2]) * refractive_index) * -1.0f;
+        }
+
+        normal = normalize_vec(normal);
+
+        desiredNormals.push_back(normal);
     }
 
-    return residual / u.res_x * u.res_y;
+    return desiredNormals;
 }
 
-void export_transported_pts(Domain& u) {
-    std::vector<std::vector<double>> points;
+Mesh extract_map(Domain<double>& u) {
+    Mesh mesh(0.0, 1.0, 0.0, 1.0, u.res_x, u.res_y);
 
     // Generate points
     for (int i = 0; i < u.res_y; ++i) {
         for (int j = 0; j < u.res_x; ++j) {
             std::vector<int> pos = {j, i};
 
-            double grad_x = 0.0;
-            double grad_y = 0.0;
+            std::vector<double> grad = u.gradient(i, j);
 
-            // compute x gradient
-            if (j > 0 && j < u.res_x-1) {
-                grad_x = (u.u[i][j+1] - u.u[i][j-1]) / (2.0 * u.h);
-            } else if (j == 0) {
-                grad_x = (u.u[i][j+1] - u.u[i][j]) / u.h;
-            } else {
-                grad_x = (u.u[i][j] - u.u[i][j-1]) / u.h;
-            }
+            int index = i * u.res_x + j;
 
-            // compute y gradient
-            if (i > 0 && i < u.res_y-1) {
-                grad_y = (u.u[i+1][j] - u.u[i-1][j]) / (2.0 * u.h);
-            } else if (i == 0) {
-                grad_y = (u.u[i+1][j] - u.u[i][j]) / u.h;
-            } else {
-                grad_y = (u.u[i][j] - u.u[i-1][j]) / u.h;
-            }
-
-            if (std::isinf(grad_x)) {
-                grad_x = 0.0;
-            }
-
-            if (std::isinf(grad_y)) {
-                grad_y = 0.0;
-            }
-
-            points.push_back({grad_x+0.5, grad_y+0.5, 0.0});
+            mesh.source_points[index] = {grad[0]+0.5, grad[1]+0.5, 0.0};
         }
     }
 
-    // export transported grid
-    export_grid_to_svg(points, 1.0, 1.0, u.res_x, u.res_y, "./grid.svg", 1.0);
+    return mesh;
 }
 
-void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector<double>>& image) {
+void export_transported_pts(Domain<double>& u) {
+    std::vector<std::vector<double>> points;
+
+    Mesh tmap = extract_map(u);
+
+    // export transported grid
+    export_grid_to_svg(tmap.source_points, 1.0, 1.0, tmap.res_x, tmap.res_y, "./grid.svg", 1.0);
+}
+
+void solve(Domain<double>& u, unsigned int max_iter, double tau, std::vector<std::vector<double>>& f_pixels, std::vector<std::vector<double>>& g_pixels) {
     std::vector<std::vector<double>> r = u.u;
     std::vector<std::vector<double>> d = u.u;
 
-    const std::vector<std::vector<int>> dirs = generate_directions(3);
-    const std::vector<std::pair<int,int>> bases = generate_bases(dirs);
+    const std::vector<std::vector<int>> dirs = u.generate_directions(8);
+    const std::vector<std::pair<int,int>> bases = u.generate_bases(dirs);
 
     double prev_residual = 0.0;
     
+    const int window = 10;
+    std::deque<double> residual_history;
+    double smoothed_residual = 0.0;
+
     for (unsigned int iter = 0; iter < max_iter; iter++) {
         double residual = 0.0;
 
         std::vector<std::vector<double>> new_u = u.u;
 
-        residual = compute_residual(u, image, dirs, bases, r);
+        residual = u.compute_residual(f_pixels, g_pixels, dirs, bases, r);
         
         subtractAverage(r);
         poisson_solver(r, d, u.res_x, u.res_y, 1e6, 1e-6, 16);
@@ -767,14 +666,31 @@ void solve(Domain& u, unsigned int max_iter, double tau, std::vector<std::vector
 
         u.u = new_u;
 
-        std::cout << "Iter " << iter << " max residual = " << residual << ", change = " << prev_residual - residual << std::endl;
-        if (std::abs(prev_residual - residual) < 0.001) break;
+        // --- smoothing update ---
+        residual_history.push_back(residual);
+        if (residual_history.size() > window) {
+            residual_history.pop_front();
+        }
+        smoothed_residual = std::accumulate(residual_history.begin(), residual_history.end(), 0.0)
+                            / residual_history.size();
+
+        // stop if smoothed residual change is small
+        if (iter > window) {
+            double prev_avg = std::accumulate(residual_history.begin(), residual_history.end() - 1, 0.0)
+                            / (residual_history.size() - 1);
+        
+            std::cout << "Iter " << iter << " max residual = " << residual << ", change = " << prev_avg - smoothed_residual << std::endl;
+
+            if (std::abs(prev_avg - smoothed_residual) < 0.0001) {
+                break;
+            }
+        } else {
+            std::cout << "Iter " << iter << " max residual = " << residual << ", change = " << smoothed_residual << std::endl;
+        }
 
         if (iter % 10 == 0) {
             export_transported_pts(u);
         }
-
-        prev_residual = residual;
     }
 }
 //*/
@@ -786,7 +702,8 @@ int main(int argc, char** argv) {
     args::ArgumentParser parser("", "");
     args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
 
-    args::ValueFlag<std::string>    input_png(parser, "image", "Image input", {"input_png"});
+    args::ValueFlag<std::string>    target_png(parser, "image", "Input target image", {"target_png"});
+    args::ValueFlag<std::string>    source_png(parser, "image", "Input source image", {"source_png"});
     args::ValueFlag<unsigned int>   resolution(parser, "resolution", "Resolution", {"res_w"});
     
     try
@@ -811,28 +728,86 @@ int main(int argc, char** argv) {
     }
 
     // default values
-    std::string image_filename = "";
+    std::string f_image_filename = "";
+    std::string g_image_filename = "";
 
     bool output_progress = false;
     unsigned int res_w = 100;
 
-    if (input_png) { 
-        image_filename = args::get(input_png);
+    if (target_png) { 
+        f_image_filename = args::get(target_png);
+    }
+
+    if (source_png) { 
+        g_image_filename = args::get(source_png);
     }
 
     if (resolution) {
         res_w = args::get(resolution);
     }
 
-	std::vector<std::vector<double>> pixels;
-    image_to_grid(image_filename.c_str(), pixels);
+	std::vector<std::vector<double>> f_pixels;
+    std::vector<std::vector<double>> g_pixels;
+    image_to_grid(f_image_filename.c_str(), f_pixels);
+    image_to_grid(g_image_filename.c_str(), g_pixels);
+
     //pixels = scale_matrix_proportional(pixels, 0.0, 1.0);
-    pixels = hammingResize(pixels, pixels[0].size(), res_w);
+    f_pixels = hammingResize(f_pixels, f_pixels[0].size(), res_w);
 
-    normalizeImage(pixels);
+    normalizeImage(f_pixels, 1.0, 1.0);
+    normalizeImage(g_pixels, 1.0, 1.0);
 
+    normal_integration normal_int;
+    Domain<double> u(f_pixels[0].size(), f_pixels.size());
 
-    Domain u(pixels[0].size(), pixels.size());
+    solve(u, 10000, 1.0 / (u.res_x * u.res_y), f_pixels, g_pixels);
 
-    solve(u, 10000, 1.0 / (u.res_x * u.res_y), pixels);
+    std::vector<std::vector<double>> points;
+    Mesh tmap = extract_map(u);
+    Mesh mesh(0.0, 1.0, 0.0, 1.0, 128, 128);
+    mesh.make_circular();
+
+    std::vector<std::vector<double>> trg_pts = apply_inverse_map(tmap, mesh.source_points);
+    export_grid_to_svg(trg_pts, 1.0, 1.0, mesh.res_x, mesh.res_y, "./grid_inv.svg", 1.0);
+
+    mesh.build_vertex_to_triangles();
+
+    normal_int.initialize_data(mesh);
+
+    std::vector<std::vector<double>> desired_normals;
+
+    double focal_l = 1.0;
+    double thickness = 0.2;
+
+    //scalePoints(trg_pts, {8, 8, 0}, {0.5, 0.5, 0});
+    //rotatePoints(trg_pts, {0, 0, 0});
+    translatePoints(trg_pts, {0, 0, -focal_l});
+
+    double r = 1.55;
+
+    mesh.calculate_vertex_laplacians();
+
+    for (int i=0; i<10; i++)
+    {
+        double max_z = -10000;
+
+        for (int j = 0; j < mesh.source_points.size(); j++) {
+            if (max_z < mesh.source_points[j][2]) {
+            max_z = mesh.source_points[j][2];
+            }
+        }
+
+        for (int j = 0; j < mesh.source_points.size(); j++) {
+            mesh.source_points[j][2] -= max_z;
+        }
+
+        //std::cout << "mesh.source_points.size() = " << mesh.source_points.size() << std::endl;
+        //std::cout << "trg_pts.size() = " << trg_pts.size() << std::endl;
+        
+        std::vector<std::vector<double>> normals = fresnelMapping(mesh.source_points, trg_pts, r);
+
+        normal_int.perform_normal_integration(mesh, normals);
+    }
+
+    mesh.save_solid_obj_source(thickness, "./output.obj");
 }
